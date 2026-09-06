@@ -1,103 +1,194 @@
-import ollama
 import json
 import os
+from datetime import datetime, timedelta
+import chromadb
+import ollama
 
-# Configuration
-BASE_MODEL = "llama3.2"           
-EVOLVING_MODEL = "my_evolving_ai" 
-OBSERVER_MODEL = "llama3.2"       
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+BASE_MODEL = "llama3.2"
+EVOLVING_MODEL = "my_evolving_ai"
+OBSERVER_MODEL = "llama3.2"
+EMBEDDING_MODEL = "nomic-embed-text"
 
-# 1. Initial Setup
-current_system = "You are a neutral AI assistant. You have no personality yet."
-memory_bank = []    # This will now ONLY store permanent, long-term memories
-chat_history = []   # This stores short-term memory and resets when the script closes
+MEMORY_FILE = "memories.json"
+SHORT_TERM_WINDOW = timedelta(days=2)  # Consolidate memories older than 2 days
 
-# --- Load previous long-term state if it exists ---
-if os.path.exists("ai_state.json"):
-    with open("ai_state.json", "r") as f:
-        saved_state = json.load(f)
-        current_system = saved_state.get("system", current_system)
-        memory_bank = saved_state.get("long_term_memories", [])
-        print("Loaded previous long-term memories and personality from disk!")
+# ==========================================
+# 2. VECTOR DATABASE SETUP (Permanent Facts)
+# ==========================================
+chroma_client = chromadb.PersistentClient(path="./vector_memory")
+collection = chroma_client.get_or_create_collection(name="technical_facts")
 
-# Inject loaded memories into the starting prompt
-memory_string = "\n\nLong-Term Memories:\n" + "\n".join(memory_bank) if memory_bank else ""
-final_system_prompt = current_system + memory_string
+def get_embedding(text):
+    """Converts text into a vector using the local embedding model."""
+    response = ollama.embed(model=EMBEDDING_MODEL, input=text)
+    return response["embeddings"]
 
-# Create the model 
-ollama.create(model=EVOLVING_MODEL, from_=BASE_MODEL, system=final_system_prompt)
-print("System initialized. Start chatting!")
+# ==========================================
+# 3. TEMPORAL MEMORY SETUP (Context & Personality)
+# ==========================================
+def load_memory_store():
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r") as f:
+            return json.load(f)
+    return {
+        "personality": "You are a highly capable and thoughtful AI assistant. Your tone reflects past interactions.",
+        "long_term_core": "No long-term history established yet.",
+        "short_term_memories": []
+    }
+
+def save_memory_store(store):
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(store, f, indent=2)
+
+memory_store = load_memory_store()
+
+def consolidate_memories_by_age():
+    """Merges aged short-term memories into the long-term core."""
+    global memory_store
+    now = datetime.now()
+    
+    matured_memories = []
+    active_short_term = []
+    
+    for entry in memory_store["short_term_memories"]:
+        entry_time = datetime.fromisoformat(entry["timestamp"])
+        if now - entry_time >= SHORT_TERM_WINDOW:
+            matured_memories.append(entry)
+        else:
+            active_short_term.append(entry)
+            
+    if matured_memories:
+        print(f"\n⏳ Consolidating {len(matured_memories)} matured memory/memories into long-term storage...")
+        matured_text = "\n".join([f"- [{m['timestamp'][:10]}] {m['content']}" for m in matured_memories])
+        
+        consolidation_prompt = f"""
+        You are managing the memory consolidation of an AI.
+        
+        Existing Long-Term Summary:
+        {memory_store['long_term_core']}
+        
+        Older memories to consolidate:
+        {matured_text}
+        
+        Task: Synthesize both into a single, cohesive, dense summary paragraph. Preserve vital facts and user preferences, but generalize details that are no longer immediately relevant.
+        """
+        
+        response = ollama.generate(model=OBSERVER_MODEL, prompt=consolidation_prompt)
+        memory_store["long_term_core"] = response["response"].strip()
+        memory_store["short_term_memories"] = active_short_term
+        save_memory_store(memory_store)
+        print("🧠 Temporal consolidation complete.")
+
+def build_base_system_prompt():
+    """Constructs the foundational system prompt from temporal memory."""
+    prompt = f"{memory_store['personality']}\n\n=== LONG-TERM MEMORY ===\n{memory_store['long_term_core']}\n"
+    if memory_store["short_term_memories"]:
+        prompt += "\n=== RECENT SHORT-TERM MEMORIES ===\n"
+        for m in memory_store["short_term_memories"]:
+            prompt += f"- [{m['timestamp'][:16]}] {m['content']}\n"
+    return prompt
+
+# Initialize the evolving model on startup
+consolidate_memories_by_age()
+ollama.create(
+    model=EVOLVING_MODEL,
+    from_=BASE_MODEL,
+    system=build_base_system_prompt()
+)
+print("\nSystem ready. Start chatting! (Type '/bye' to exit)\n" + "-"*50)
+
+# ==========================================
+# 4. MAIN ORCHESTRATION LOOP
+# ==========================================
+chat_history = []
 
 while True:
     user_input = input("\nYou: ")
     if user_input.lower() in ['/bye', 'exit', 'quit']:
-        print("Saving state and exiting. Goodbye!")
         break
         
-    # Keep short-term memory manageable (store only the last 20 messages)
-    if len(chat_history) > 20: 
-        chat_history = chat_history[-20:]
-
-    chat_history.append({"role": "user", "content": user_input})
+    # --- A. Retrieval Phase (RAG) ---
+    query_vector = get_embedding(user_input)
+    results = collection.query(
+        query_embeddings=query_vector,
+        n_results=2
+    )
     
-    # 2. Primary AI Responds using short-term and long-term context
-    response = ollama.chat(model=EVOLVING_MODEL, messages=chat_history)
+    retrieved_facts = results['documents'][0] if results['documents'] else []
+    
+    # Prepend retrieved facts as a temporary system instruction for this turn only
+    turn_messages = []
+    if retrieved_facts:
+        fact_string = "\n".join(retrieved_facts)
+        turn_messages.append({
+            "role": "system", 
+            "content": f"Use these permanent technical facts if relevant to the user's query:\n{fact_string}"
+        })
+        
+    turn_messages.extend(chat_history)
+    turn_messages.append({"role": "user", "content": user_input})
+    
+    # --- B. Actor Phase ---
+    response = ollama.chat(model=EVOLVING_MODEL, messages=turn_messages)
     ai_text = response['message']['content']
     print(f"\nAI: {ai_text}\n")
-    chat_history.append({"role": "assistant", "content": ai_text})
     
-    # 3. Observer AI Analyzes specifically for Long-Term Value
-    print("--- Observer is updating Modelfile... ---")
+    # Update active chat history
+    chat_history.append({"role": "user", "content": user_input})
+    chat_history.append({"role": "assistant", "content": ai_text})
+
+    # --- C. Observer Phase ---
     observer_prompt = f"""
-    Analyze this recent exchange:
+    Analyze this interaction:
     User: {user_input}
     AI: {ai_text}
     
-    Provide a JSON response with exactly these three keys:
-    "long_term_fact": Extract ONLY permanent, long-term facts about the user (e.g., name, job, preferences, goals). Do NOT include short-term temporal events (e.g., "User said hello", "User is testing the script"). If there is no new permanent fact to save, return an empty string "".
-    "tone_analysis": A brief note on how the AI's personality should shift or evolve based on this chat.
-    "new_system": A revised system prompt that adopts this evolving personality and tone. Do not include the memories in this prompt.
+    Provide a JSON object with EXACTLY these three keys:
+    "temporal_memory": A factual, 1-sentence summary of what was just discussed to add to the short-term buffer.
+    "personality_update": A revised system instruction shaping the AI's tone, improving it based on this interaction. Keep it concise.
+    "permanent_fact": Isolate any concrete technical facts, code snippets, or configurations discussed that should be remembered forever. Leave blank if none exist.
     """
     
-    # Force the observer to output strict JSON
     obs_response = ollama.generate(
         model=OBSERVER_MODEL, 
         prompt=observer_prompt, 
-        format="json" 
+        format="json"
     )
     
-    # 4. Parse Feedback, Save Permanently, and Rebuild
+    # --- D. Orchestration & Updates ---
     try:
         feedback = json.loads(obs_response['response'])
         
-        # Process the memory (Only append if the observer actually found a long-term fact)
-        new_fact = feedback.get("long_term_fact", "").strip()
-        if new_fact:
-            memory_bank.append(new_fact)
-            print(f"New long-term memory recorded: {new_fact}")
-        else:
-            print("No new long-term memory detected.")
-
-        current_system = feedback.get("new_system", current_system)
-        print(f"Tone shift: {feedback.get('tone_analysis')}")
+        # 1. Save Permanent Fact to Vector DB
+        new_fact = feedback.get("permanent_fact", "")
+        if new_fact and len(new_fact) > 10:
+            fact_id = f"fact_{len(collection.get()['ids'])}"
+            collection.add(
+                ids=[fact_id],
+                embeddings=get_embedding(new_fact),
+                documents=[new_fact]
+            )
+            print("💾 Permanent fact saved to vector database.")
         
-        # --- Save the state permanently to your hard drive ---
-        with open("ai_state.json", "w") as f:
-            json.dump({
-                "system": current_system,
-                "long_term_memories": memory_bank
-            }, f, indent=4)
+        # 2. Update Temporal Memory & Personality
+        new_memory = {
+            "timestamp": datetime.now().isoformat(),
+            "content": feedback.get("temporal_memory", "")
+        }
+        memory_store["short_term_memories"].append(new_memory)
+        memory_store["personality"] = feedback.get("personality_update", memory_store["personality"])
+        save_memory_store(memory_store)
         
-        # Combine the new personality with the historical long-term memory bank
-        memory_string = "\n\nLong-Term Memories:\n" + "\n".join(memory_bank)
-        final_system_prompt = current_system + memory_string
-        
-        # Rebuild the model directly through the API
+        # 3. Consolidate if necessary and Rebuild Model
+        consolidate_memories_by_age()
         ollama.create(
-            model=EVOLVING_MODEL, 
-            from_=BASE_MODEL, 
-            system=final_system_prompt
+            model=EVOLVING_MODEL,
+            from_=BASE_MODEL,
+            system=build_base_system_prompt()
         )
         
     except json.JSONDecodeError:
-        print("Observer failed to output valid JSON. Skipping model update this turn.")
+        print("Observer parsing error; skipping memory updates for this turn.")
